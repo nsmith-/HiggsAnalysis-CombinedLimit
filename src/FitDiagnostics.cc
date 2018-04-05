@@ -20,6 +20,8 @@
 #include "TStyle.h"
 #include "TH2.h"
 #include "TFile.h"
+#include "TMath.h"
+#include "TRandom.h"
 #include <RooStats/ModelConfig.h>
 #include "HiggsAnalysis/CombinedLimit/interface/CMSHistErrorPropagator.h"
 #include "HiggsAnalysis/CombinedLimit/interface/Combine.h"
@@ -51,6 +53,7 @@ bool        FitDiagnostics::oldNormNames_ = false;
 bool        FitDiagnostics::saveShapes_ = false;
 bool        FitDiagnostics::saveOverallShapes_ = false;
 bool        FitDiagnostics::saveWithUncertainties_ = false;
+bool        FitDiagnostics::savePulls_ = false;
 bool        FitDiagnostics::justFit_ = false;
 bool        FitDiagnostics::skipBOnlyFit_ = false;
 bool        FitDiagnostics::noErrors_ = false;
@@ -81,6 +84,7 @@ FitDiagnostics::FitDiagnostics() :
         ("oldNormNames",  	"Name the normalizations as in the workspace, and not as channel/process")
         ("saveShapes",  	"Save pre and post-fit distributions as TH1 in fitDiagnostics.root")
         ("saveWithUncertainties",  "Save also pre/post-fit uncertainties on the shapes and normalizations (from resampling the covariance matrix)")
+        ("savePulls",           "Save also pre/post-fit pulls for the data with respect to the model (from resampling the covariance matrix)")
         ("saveOverallShapes",  "Save total shapes (and covariance if used with --saveWithUncertainties), ie will produce TH1 (TH2) merging bins across all channels")
         ("numToysForShapes", 	boost::program_options::value<int>(&numToysForShapes_)->default_value(numToysForShapes_),  "Choose number of toys for re-sampling of the covariance (for shapes with uncertainties)")
         ("filterString",	boost::program_options::value<std::string>(&filterString_)->default_value(filterString_), "Filter to search for when making covariance and shapes")
@@ -120,6 +124,7 @@ void FitDiagnostics::applyOptions(const boost::program_options::variables_map &v
     savePredictionsPerToy_ = vm.count("savePredictionsPerToy");
     oldNormNames_  = vm.count("oldNormNames");
     saveWithUncertainties_  = vm.count("saveWithUncertainties");
+    savePulls_  = vm.count("savePulls");
     justFit_  = vm.count("justFit");
     skipBOnlyFit_ = vm.count("skipBOnlyFit");
     noErrors_ = vm.count("noErrors");
@@ -606,7 +611,7 @@ void FitDiagnostics::getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, Roo
     std::vector<double> vals(snm.size(), 0.), sumx2(snm.size(), 0.);
     std::vector<TH1*>   shapes(snm.size(), 0), shapes2(snm.size(), 0);
     std::vector<int>    bins(snm.size(), 0), sig(snm.size(), 0);
-    std::map<std::string,TH1*> totByCh, totByCh2, sigByCh, sigByCh2, bkgByCh, bkgByCh2;
+    std::map<std::string,TH1*> totByCh, totByCh2, sigByCh, sigByCh2, bkgByCh, bkgByCh2, pullsByCh;
     std::map<std::string,TH2*> totByCh2Covar;
     IT bg = snm.begin(), ed = snm.end(), pair; int i;
     for (pair = bg, i = 0; pair != ed; ++pair, ++i) {  
@@ -654,6 +659,15 @@ void FitDiagnostics::getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, Roo
                     (sig[i] ? sigByCh2 : bkgByCh2)[pair->second.channel] = hpart2;
             } else {
                     hpart->Add(hist);
+            }
+            TH1 *& hpull = pullsByCh[pair->second.channel];
+            if (hpull == 0) {
+                    hpull = (TH1*) hist->Clone();
+                    hpull->Reset();
+                    hpull->SetName("pulls");
+                    hpull->SetTitle(Form("Pull of observation w.r.t. total signal+background in %s", pair->second.channel.c_str()));
+                    hpull->GetYaxis()->SetTitle("Data-model pull (#sigma)");
+                    hpull->SetDirectory(shapesByChannel[pair->second.channel]);
             }
             //}
         }
@@ -726,6 +740,20 @@ void FitDiagnostics::getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, Roo
         for (IH h = totByCh.begin(), eh = totByCh.end(); h != eh; ++h) totByCh1[h->first] = (TH1*) h->second->Clone();
         for (IH h = sigByCh.begin(), eh = sigByCh.end(); h != eh; ++h) sigByCh1[h->first] = (TH1*) h->second->Clone();
         for (IH h = bkgByCh.begin(), eh = bkgByCh.end(); h != eh; ++h) bkgByCh1[h->first] = (TH1*) h->second->Clone();
+
+        // prepare vector of bin contents for finding per-bin quantiles
+        // perbin_vals[channel_name][histogram_bin_index][toy_index]
+        std::map<std::string, std::vector<std::vector<double> > > total_perchannel_perbin_vals;
+        if (savePulls_) {
+            for (IH h = totByCh.begin(), eh = totByCh.end(); h != eh; ++h) {
+                size_t nBinsCh = h->second->GetNbinsX();
+                total_perchannel_perbin_vals[h->first].resize(nBinsCh);
+                for (size_t iBin=0; iBin<(size_t) nBinsCh; ++iBin) {
+                    total_perchannel_perbin_vals[h->first][iBin].resize(ntoys, 0.);
+                }
+            }
+        }
+
         for (int t = 0; t < ntoys; ++t) {
             // zero out partial sums
             for (IH h = totByCh1.begin(), eh = totByCh1.end(); h != eh; ++h) h->second->Reset();
@@ -744,6 +772,7 @@ void FitDiagnostics::getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, Roo
                     hist->Scale(pair->second.norm->getVal() / hist->Integral("width"));
                     for (int b = 1; b <= bins[i]; ++b) {
                         shapes2[i]->AddBinContent(b, std::pow(hist->GetBinContent(b) - shapes[i]->GetBinContent(b), 2));
+                        if (savePulls_) total_perchannel_perbin_vals[pair->second.channel][b-1][t] += hist->GetBinContent(b);
                     }
                     // and cumulate in the total for this toy as well
                     totByCh1[pair->second.channel]->Add(&*hist);
@@ -824,6 +853,30 @@ void FitDiagnostics::getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, Roo
 		TString xLabel = Form("%s_%d",h->first.c_str(),b-1);
 		totOverall->SetBinError(binMap[xLabel],std::sqrt(sum2->GetBinContent(b)/ntoys));
                 h->second->SetBinError(b, std::sqrt(sum2->GetBinContent(b)/ntoys));
+                if (savePulls_) {
+                    // Compute pull by finding quantile of observation w.r.t toy observations
+                    double junk, obs;
+                    datByCh[h->first]->GetPoint(b-1, junk, obs);  // data is zero-indexed
+                    std::vector<double>& toy_obs = total_perchannel_perbin_vals[h->first][b-1];
+                    // make toy yields into pseudoexperiment observations
+                    for (auto& v : toy_obs) v = gRandom->Poisson(v);
+                    std::sort(toy_obs.begin(), toy_obs.end());
+                    int iToyBelow = ntoys-1;
+                    int iToyAbove = 0;
+                    for (; iToyBelow>=0; --iToyBelow) if ( toy_obs[iToyBelow] < obs ) break;
+                    for (; iToyAbove<ntoys; ++iToyAbove) if ( toy_obs[iToyAbove] > obs ) break;
+                    double quantile = (iToyAbove+iToyBelow+1)/2./(double) ntoys;
+                    if ( quantile == 0. or quantile == 1. ) {
+                        if ( verbose > 0 ) Logger::instance().log(std::string(Form(
+                                        "FitDiagnostics.cc: %d -- Observation in bin %d of channel %s is outside the range "
+                                        "of all toy pseudoexperiment observations, will move quantile 0.25/ntoys away from 0 or 1.\n"
+                                        "Consider increasing the number of toys using --numToysForShapes",
+                                        __LINE__, b, h->first.c_str())),Logger::kLogLevelInfo,__func__);
+                        quantile = (quantile==0.) ? 0.25/ntoys : 1-0.25/ntoys;
+                    }
+                    double pull = TMath::NormQuantile(quantile);
+                    pullsByCh[h->first]->SetBinContent(b, pull);
+                }
             }
             delete sum2; delete totByCh1[h->first];
 	}
@@ -880,6 +933,7 @@ void FitDiagnostics::getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, Roo
         for (IH h = totByCh.begin(), eh = totByCh.end(); h != eh; ++h) { shapesByChannel[h->first]->WriteTObject(h->second); }
         for (IH h = sigByCh.begin(), eh = sigByCh.end(); h != eh; ++h) { shapesByChannel[h->first]->WriteTObject(h->second); }
         for (IH h = bkgByCh.begin(), eh = bkgByCh.end(); h != eh; ++h) { shapesByChannel[h->first]->WriteTObject(h->second); }
+        if (savePulls_) for (IH h = pullsByCh.begin(), eh = pullsByCh.end(); h != eh; ++h) { shapesByChannel[h->first]->WriteTObject(h->second); }
         for (IH2 h = totByCh2Covar.begin(), eh = totByCh2Covar.end(); h != eh; ++h) { shapesByChannel[h->first]->WriteTObject(h->second); }
 	//Save total shapes or clean up if not keeping
 	if (saveShapes_) shapeDir->cd();
