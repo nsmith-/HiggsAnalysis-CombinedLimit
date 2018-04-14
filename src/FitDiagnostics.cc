@@ -857,9 +857,11 @@ void FitDiagnostics::getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, Roo
                     // Compute pull by finding quantile of observation w.r.t toy observations
                     double junk, obs;
                     datByCh[h->first]->GetPoint(b-1, junk, obs);  // data is zero-indexed
+                    double binW = h->second->GetBinWidth(b);
+                    obs *= binW;
                     std::vector<double>& toy_obs = total_perchannel_perbin_vals[h->first][b-1];
                     // make toy yields into pseudoexperiment observations
-                    for (auto& v : toy_obs) v = gRandom->Poisson(v);
+                    for (auto& v : toy_obs) v = gRandom->Poisson(v*binW);
                     std::sort(toy_obs.begin(), toy_obs.end());
                     int iToyBelow = ntoys-1;
                     int iToyAbove = 0;
