@@ -21,8 +21,13 @@ git checkout 112x
 
 conda install --name base mamba # faster conda
 mamba env create -f conda_env.yml
+
 conda activate combine
 bash set_conda_env_vars.sh
+# Need to reactivate
+conda deactivate
+conda activate combine
+
 make -f Makefile_conda -j 8
 ```
 
